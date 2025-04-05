@@ -1,0 +1,45 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  # push:
+  #   branches:
+  #     - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Build executable
+        run: |
+          cargo fmt
+          cargo build --release
+
+      - name: Move executable file
+        id: executable-info
+        run: |
+          EXECUTABLE_NAME="wiki_update"
+          mv -f target/release/${EXECUTABLE_NAME} ${EXECUTABLE_NAME}
+
+          echo "executable_name=${EXECUTABLE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore[action] update wiki bin file"
+          push_options: '--force'
+          file_pattern: wiki_update
+          commit_user_name: github-actions[bot]
+          commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
