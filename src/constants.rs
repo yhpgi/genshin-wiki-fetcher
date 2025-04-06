@@ -4,7 +4,6 @@ use reqwest::header::{
     HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE, ORIGIN, REFERER, USER_AGENT,
 };
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 pub const BASE_API_URL: &str = "https://sg-wiki-api-static.hoyolab.com/hoyowiki/genshin/wapi";
 
@@ -30,9 +29,8 @@ pub static SUPPORTED_LANGS: Lazy<Vec<String>> = Lazy::new(|| {
 pub const OUT_DIR: &str = "./";
 pub const PAGE_SIZE: i64 = 30;
 pub const MAX_LIST_CONCUR: usize = 20;
-pub const MAX_DETAIL_CONCUR: usize = 30;
-pub const MAX_BULK_CONCUR: usize = 20;
-pub const LIST_FETCH_DELAY: Duration = Duration::from_millis(10);
+pub const MAX_DETAIL_CONCUR: usize = 1000;
+pub const MAX_BULK_CONCUR: usize = 1000;
 pub const HTTP_TIMEOUT_SECONDS: u64 = 30;
 pub const HTTP_CONNECT_TIMEOUT: u64 = 15;
 pub const MAX_RETRIES: u32 = 3;

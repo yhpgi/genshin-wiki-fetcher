@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{from_value, json, Value};
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -540,7 +540,6 @@ pub async fn fetch_menu_list(
     lang: String,
     id: MenuId,
     name: String,
-    dir: PathBuf,
 ) -> AppResult<Option<OutputListFile>> {
     let mut raw_list_items: Vec<ListItem> = Vec::new();
     let mut total = None;
@@ -570,10 +569,6 @@ pub async fn fetch_menu_list(
                     Some(&payload),
                 )
                 .await;
-
-            if !LIST_FETCH_DELAY.is_zero() {
-                sleep(LIST_FETCH_DELAY).await;
-            }
 
             match result {
                 Ok(data) => data,
@@ -655,24 +650,14 @@ pub async fn fetch_menu_list(
         });
     }
 
-    let out = OutputListFile {
+    Ok(Some(OutputListFile {
         version: Utc::now(),
         language: lang.clone(),
         menu_id: id,
         menu_name: name.clone(),
         total_items: final_processed_items.len(),
         list: final_processed_items,
-    };
-    let fpath = dir.join(&lang).join(format!(
-        "{}.json",
-        crate::utils::clean_filename(&id.to_string())
-    ));
-
-    if crate::utils::save_json(&fpath, out.clone(), &format!("List {}", ctx)).await? {
-        Ok(Some(out))
-    } else {
-        Ok(None)
-    }
+    }))
 }
 
 #[derive(Default, Debug)]

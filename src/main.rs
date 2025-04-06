@@ -15,8 +15,9 @@ use crate::utils::{collect_nested_ep_ids, run_blocking, save_json, update_value_
 use chrono::Utc;
 use clap::Parser;
 use fs_extra::dir::remove;
+use futures::future::join_all;
 use futures::stream::{self, StreamExt};
-use serde_json::{from_str, Value};
+use serde_json::{to_value, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,12 +38,23 @@ struct RunCategoryStats {
     fail: usize,
     empty: usize,
     total: usize,
-    files_processed: usize,
-    files_updated: usize,
-    files_failed: usize,
+    updated_in_bulk: usize,
 }
 
 type RunStats = BTreeMap<String, RunCategoryStats>;
+
+#[derive(Default)]
+struct InMemoryData {
+    navigation: HashMap<String, Vec<NavMenuItem>>,
+    lists: HashMap<String, Vec<OutputListFile>>,
+    details: HashMap<String, Vec<OutputDetailPage>>,
+    calendars: HashMap<String, OutputCalendarFile>,
+    all_ids: HashMap<String, HashSet<EntryId>>,
+}
+
+type BulkDataMap = HashMap<EntryId, Value>;
+type FallbackBulkDataMap = HashMap<String, BulkDataMap>;
+type AllBulkData = HashMap<String, (BulkDataMap, FallbackBulkDataMap)>;
 
 async fn setup_dirs(dirs: &HashMap<&str, PathBuf>, langs: &[String]) -> AppResult<()> {
     log(LogLevel::Step, "Preparing output directories...");
@@ -178,13 +190,17 @@ async fn main_async() -> AppResult<i32> {
     let list_sem = Arc::new(Semaphore::new(MAX_LIST_CONCUR));
     let detail_sem = Arc::new(Semaphore::new(MAX_DETAIL_CONCUR));
     let bulk_sem = Arc::new(Semaphore::new(MAX_BULK_CONCUR));
-    let refresh_sem = Arc::new(Semaphore::new(MAX_BULK_CONCUR));
+    let cal_sem = Arc::new(Semaphore::new(5));
+
     let mut stats = RunStats::new();
     stats.insert("Navigation".into(), Default::default());
     stats.insert("List".into(), Default::default());
     stats.insert("Detail".into(), Default::default());
     stats.insert("Calendar".into(), Default::default());
-    stats.insert("Bulk Refresh".into(), Default::default());
+    stats.insert("Bulk Fetch".into(), Default::default());
+    stats.insert("Save".into(), Default::default());
+
+    let mut data_store = InMemoryData::default();
 
     log(
         LogLevel::Step,
@@ -202,7 +218,7 @@ async fn main_async() -> AppResult<i32> {
         }));
     }
 
-    let mut nav_results: HashMap<String, Vec<NavMenuItem>> = HashMap::new();
+    let mut nav_save_tasks = Vec::new();
     for handle in nav_tasks {
         match handle.await {
             Ok((lang, dir, Ok(menus_data))) => {
@@ -213,12 +229,14 @@ async fn main_async() -> AppResult<i32> {
                     let path = dir.join(format!("{}.json", lang));
                     let menus_to_save = menus_data.clone();
                     let lang_clone = lang.clone();
-                    if save_json(&path, menus_to_save, &format!("Nav [{}]", lang_clone)).await? {
-                        stats.get_mut("Navigation").unwrap().ok += 1;
-                        nav_results.insert(lang, menus_data);
-                    } else {
-                        stats.get_mut("Navigation").unwrap().fail += 1;
-                    }
+                    nav_save_tasks.push(tokio::spawn(async move {
+                        (
+                            lang_clone.clone(),
+                            save_json(&path, menus_to_save, &format!("Nav [{}]", lang_clone)).await,
+                        )
+                    }));
+                    data_store.navigation.insert(lang, menus_data);
+                    stats.get_mut("Navigation").unwrap().ok += 1;
                 }
             }
 
@@ -233,6 +251,36 @@ async fn main_async() -> AppResult<i32> {
             Err(e) => {
                 log(LogLevel::Error, &format!("Nav Task Panic! {}", e));
                 stats.get_mut("Navigation").unwrap().fail += 1;
+            }
+        }
+    }
+
+    stats.get_mut("Save").unwrap().total += nav_save_tasks.len();
+    for handle in nav_save_tasks {
+        match handle.await {
+            Ok((_, Ok(true))) => {
+                stats.get_mut("Save").unwrap().ok += 1;
+            }
+
+            Ok((lang, Ok(false))) => {
+                log(
+                    LogLevel::Error,
+                    &format!("Nav Save FAIL (silent) [{}]", lang),
+                );
+                stats.get_mut("Save").unwrap().fail += 1;
+            }
+
+            Ok((lang, Err(e))) => {
+                log(
+                    LogLevel::Error,
+                    &format!("Nav Save FAIL (error) [{}]. Err: {:?}", lang, e),
+                );
+                stats.get_mut("Save").unwrap().fail += 1;
+            }
+
+            Err(e) => {
+                log(LogLevel::Error, &format!("Nav Save Task Panic! {}", e));
+                stats.get_mut("Save").unwrap().fail += 1;
             }
         }
     }
@@ -253,7 +301,7 @@ async fn main_async() -> AppResult<i32> {
     log(LogLevel::Step, "--- Phase 2: Fetch Menu Lists ---");
     let mut list_tasks = Vec::new();
     let mut total_list_tasks = 0;
-    for (lang, menus) in nav_results.iter() {
+    for (lang, menus) in data_store.navigation.iter() {
         for menu in menus {
             total_list_tasks += 1;
             let c = client.clone();
@@ -261,15 +309,13 @@ async fn main_async() -> AppResult<i32> {
             let l = lang.clone();
             let mid = menu.menu_id;
             let mn = menu.name.clone();
-            let ld = dirs["list"].clone();
             list_tasks.push(tokio::spawn(async move {
-                fetch_menu_list(c, ls, l, mid, mn, ld).await
+                fetch_menu_list(c, ls, l, mid, mn).await
             }));
         }
     }
 
     stats.get_mut("List").unwrap().total = total_list_tasks;
-    let mut list_results: Vec<OutputListFile> = Vec::new();
     if total_list_tasks > 0 {
         log(
             LogLevel::Info,
@@ -282,25 +328,38 @@ async fn main_async() -> AppResult<i32> {
                 processed += 1;
                 match res {
                     Ok(Ok(Some(data))) => {
+                        let lang = data.language.clone();
+                        let lang_ids = data_store.all_ids.entry(lang.clone()).or_default();
+                        for item in &data.list {
+                            lang_ids.insert(item.id);
+                            if let Some(df) = &item.display_field {
+                                if let Err(e) = collect_nested_ep_ids(df, lang_ids, 0) {
+                                    log(LogLevel::Warning, &format!("Failed collecting IDs from list display_field [{}/{}]: {:?}", lang, item.id, e));
+                                }
+                            }
+                             if let Err(e) = collect_nested_ep_ids(&item.filter_values, lang_ids, 0) {
+                                 log(LogLevel::Warning, &format!("Failed collecting IDs from list filter_values [{}/{}]: {:?}", lang, item.id, e));
+                             }
+                        }
+                        data_store
+                            .lists
+                            .entry(lang)
+                            .or_default()
+                            .push(data);
                         stats.get_mut("List").unwrap().ok += 1;
-                        list_results.push(data);
                     }
-
                     Ok(Ok(None)) => {
                         stats.get_mut("List").unwrap().empty += 1;
                     }
-
                     Ok(Err(AppError::ApiError {
                         retcode: 100010, ..
                     })) => {
                         stats.get_mut("List").unwrap().empty += 1;
                     }
-
                     Ok(Err(e)) => {
                         log(LogLevel::Error, &format!("List Task Err: {:?}", e));
                         stats.get_mut("List").unwrap().fail += 1;
                     }
-
                     Err(e) => {
                         log(LogLevel::Error, &format!("List Task Panic! {}", e));
                         stats.get_mut("List").unwrap().fail += 1;
@@ -317,10 +376,10 @@ async fn main_async() -> AppResult<i32> {
                         ),
                     );
                 }
-
                 futures::future::ready(())
             })
             .await;
+
         let list_s = stats["List"].clone();
         log(
             if list_s.fail == 0 && list_s.ok > 0 {
@@ -338,17 +397,19 @@ async fn main_async() -> AppResult<i32> {
     }
 
     log(
-        LogLevel::Info,
+        LogLevel::Step,
         "Processing list results for vision mapping...",
     );
     let mut vision_maps: HashMap<String, HashMap<EntryId, String>> = HashMap::new();
-    for list_data in &list_results {
-        let map = vision_maps.entry(list_data.language.clone()).or_default();
-        for item in &list_data.list {
-            if let Some(fv_map) = item.filter_values.as_object() {
-                if let Some(Value::String(v)) = fv_map.get("character_vision") {
-                    if !v.is_empty() {
-                        map.insert(item.id, v.clone());
+    for (lang, list_files) in &data_store.lists {
+        let map = vision_maps.entry(lang.clone()).or_default();
+        for list_data in list_files {
+            for item in &list_data.list {
+                if let Some(fv_map) = item.filter_values.as_object() {
+                    if let Some(Value::String(v)) = fv_map.get("character_vision") {
+                        if !v.is_empty() {
+                            map.insert(item.id, v.clone());
+                        }
                     }
                 }
             }
@@ -358,19 +419,20 @@ async fn main_async() -> AppResult<i32> {
     log(LogLevel::Step, "--- Phase 3: Fetch Entry Details ---");
     let mut detail_tasks = Vec::new();
     let mut total_detail_tasks = 0;
-    for list_data in &list_results {
-        for item in &list_data.list {
-            total_detail_tasks += 1;
-            let c = client.clone();
-            let ds = detail_sem.clone();
-            let l = list_data.language.clone();
-            let mid = list_data.menu_id;
-            let list_eid = item.id;
-            let dd = dirs["detail"].clone();
-            detail_tasks.push(tokio::spawn(async move {
-                let detail_result = c.fetch_entry_detail(ds, &l, mid, list_eid).await;
-                (l, list_eid, dd, detail_result)
-            }));
+    for (lang, list_files) in data_store.lists.iter() {
+        for list_data in list_files {
+            for item in &list_data.list {
+                total_detail_tasks += 1;
+                let c = client.clone();
+                let ds = detail_sem.clone();
+                let l = lang.clone();
+                let mid = list_data.menu_id;
+                let list_eid = item.id;
+                detail_tasks.push(tokio::spawn(async move {
+                    let detail_result = c.fetch_entry_detail(ds, &l, mid, list_eid).await;
+                    (l, detail_result)
+                }));
+            }
         }
     }
 
@@ -382,54 +444,42 @@ async fn main_async() -> AppResult<i32> {
         );
         let mut processed = 0;
         let detail_stream = stream::iter(detail_tasks).buffer_unordered(MAX_DETAIL_CONCUR * 2);
-        let mut save_handles = Vec::new();
+
         detail_stream
             .for_each(|res| {
                 processed += 1;
                 match res {
-                    Ok((lang, list_eid, dir, Ok(Some(data)))) => {
-                        let p = dir.join(&lang).join(format!("{}.json", list_eid));
-                        let ctx = format!("Detail Entry:{} [{}]", list_eid, lang);
-                        save_handles.push(tokio::spawn(async move {
-                            match save_json(&p, data, &ctx).await {
-                                Ok(true) => Ok(()),
-                                Ok(false) => {
-                                    log(
-                                        LogLevel::Error,
-                                        &format!(
-                                            "Detail Save FAIL (silent) {}. File: {}",
-                                            ctx,
-                                            p.display()
-                                        ),
-                                    );
-                                    Err(())
-                                }
+                    Ok((lang, Ok(Some(data)))) => {
+                         let lang_ids = data_store.all_ids.entry(lang.clone()).or_default();
+                         lang_ids.insert(data.id);
 
-                                Err(e) => {
-                                    log(
-                                        LogLevel::Error,
-                                        &format!(
-                                            "Detail Save FAIL (error) {}. File: {}. Err: {:?}",
-                                            ctx,
-                                            p.display(),
-                                            e
-                                        ),
-                                    );
-                                    Err(())
-                                }
+                         let temp_val = match to_value(&data) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log(LogLevel::Warning, &format!("Failed to serialize detail for ID collection [{}/{}]: {:?}", lang, data.id, e));
+                                Value::Null
                             }
-                        }));
+                         };
+                         if let Err(e) = collect_nested_ep_ids(&temp_val, lang_ids, 0) {
+                            log(LogLevel::Warning, &format!("Failed collecting IDs from detail [{}/{}]: {:?}", lang, data.id, e));
+                         }
+
+                        data_store
+                            .details
+                            .entry(lang)
+                            .or_default()
+                            .push(data);
                         stats.get_mut("Detail").unwrap().ok += 1;
                     }
 
-                    Ok((_lang, _list_eid, _dir, Ok(None))) => {
+                    Ok((_, Ok(None))) => {
                         stats.get_mut("Detail").unwrap().empty += 1;
                     }
 
-                    Ok((lang, list_eid, _dir, Err(e))) => {
+                    Ok((lang, Err(e))) => {
                         log(
                             LogLevel::Error,
-                            &format!("Detail Task Err [{} Entry:{}]. {:?}", lang, list_eid, e),
+                            &format!("Detail Task Err [{}]. {:?}", lang, e),
                         );
                         stats.get_mut("Detail").unwrap().fail += 1;
                     }
@@ -454,17 +504,6 @@ async fn main_async() -> AppResult<i32> {
                 futures::future::ready(())
             })
             .await;
-        let save_results = futures::future::join_all(save_handles).await;
-        let save_failures = save_results
-            .into_iter()
-            .filter(|res| res.is_err() || res.as_ref().is_ok_and(|inner_res| inner_res.is_err()))
-            .count();
-        if save_failures > 0 {
-            log(
-                LogLevel::Warning,
-                &format!("{} detail save tasks failed.", save_failures),
-            );
-        }
 
         let detail_s = stats["Detail"].clone();
         log(
@@ -491,31 +530,47 @@ async fn main_async() -> AppResult<i32> {
     );
     let mut cal_tasks = Vec::new();
     stats.get_mut("Calendar").unwrap().total = target_langs.len();
-    let cal_sem = Arc::new(Semaphore::new(5));
     for lang in target_langs.iter() {
         let c = client.clone();
         let cs = cal_sem.clone();
         let l = lang.clone();
-        let cd = dirs["calendar"].clone();
         let vm = vision_maps.get(&l).cloned().unwrap_or_default();
         cal_tasks.push(tokio::spawn(async move {
             let cal_result = c.fetch_calendar(cs, &l, &vm).await;
-            (l, cd, cal_result)
+            (l, cal_result)
         }));
     }
 
     for handle in cal_tasks {
         match handle.await {
-            Ok((lang, dir, Ok(data))) => {
-                let p = dir.join(format!("{}.json", lang));
-                if save_json(&p, data, &format!("Calendar [{}]", lang)).await? {
-                    stats.get_mut("Calendar").unwrap().ok += 1;
-                } else {
-                    stats.get_mut("Calendar").unwrap().fail += 1;
+            Ok((lang, Ok(data))) => {
+                let lang_ids = data_store.all_ids.entry(lang.clone()).or_default();
+
+                let temp_val = match to_value(&data) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log(
+                            LogLevel::Warning,
+                            &format!(
+                                "Failed to serialize calendar for ID collection [{}]: {:?}",
+                                lang, e
+                            ),
+                        );
+                        Value::Null
+                    }
+                };
+                if let Err(e) = collect_nested_ep_ids(&temp_val, lang_ids, 0) {
+                    log(
+                        LogLevel::Warning,
+                        &format!("Failed collecting IDs from calendar [{}]: {:?}", lang, e),
+                    );
                 }
+
+                data_store.calendars.insert(lang, data);
+                stats.get_mut("Calendar").unwrap().ok += 1;
             }
 
-            Ok((lang, _dir, Err(e))) => {
+            Ok((lang, Err(e))) => {
                 log(
                     LogLevel::Warning,
                     &format!("Calendar FAIL [{}]. Err: {:?}", lang, e),
@@ -543,92 +598,402 @@ async fn main_async() -> AppResult<i32> {
         ),
     );
 
-    log(LogLevel::Step, "--- Phase 5: Global Bulk Refresh ---");
-    let mut files_to_refresh: Vec<(PathBuf, String)> = Vec::new();
+    log(LogLevel::Step, "--- Phase 5: Centralized Bulk Fetch ---");
+    let mut all_bulk_data: AllBulkData = HashMap::new();
+    let mut total_ids_to_fetch = 0;
+    let all_lang_keys: Vec<String> = data_store.all_ids.keys().cloned().collect();
 
-    for lang in target_langs.iter() {
-        let nav_path = dirs["nav"].join(format!("{}.json", lang));
-        if fs::try_exists(&nav_path).await? {
-            files_to_refresh.push((nav_path, lang.clone()));
-        }
-
-        let cal_path = dirs["calendar"].join(format!("{}.json", lang));
-        if fs::try_exists(&cal_path).await? {
-            files_to_refresh.push((cal_path, lang.clone()));
-        }
-
-        let list_lang_dir = dirs["list"].join(lang);
-        if fs::try_exists(&list_lang_dir).await? {
-            let mut list_entries = fs::read_dir(list_lang_dir).await?;
-            while let Some(entry) = list_entries.next_entry().await? {
-                let path = entry.path();
-                if path.is_file() && path.extension().map_or(false, |e| e == "json") {
-                    files_to_refresh.push((path, lang.clone()));
-                }
+    for lang in &all_lang_keys {
+        if let Some(ids_for_lang) = data_store.all_ids.get(lang) {
+            if ids_for_lang.is_empty() {
+                continue;
             }
-        }
 
-        let detail_lang_dir = dirs["detail"].join(lang);
-        if fs::try_exists(&detail_lang_dir).await? {
-            let mut detail_entries = fs::read_dir(detail_lang_dir).await?;
-            while let Some(entry) = detail_entries.next_entry().await? {
-                let path = entry.path();
-                if path.is_file() && path.extension().map_or(false, |e| e == "json") {
-                    files_to_refresh.push((path, lang.clone()));
-                }
-            }
-        }
-    }
+            total_ids_to_fetch += ids_for_lang.len();
+            log(
+                LogLevel::Info,
+                &format!(
+                    "Fetching primary bulk data for {} IDs [{}]...",
+                    ids_for_lang.len(),
+                    lang
+                ),
+            );
+            stats.get_mut("Bulk Fetch").unwrap().total += ids_for_lang.len();
 
-    stats.get_mut("Bulk Refresh").unwrap().total = files_to_refresh.len();
-    log(
-        LogLevel::Info,
-        &format!(
-            "Found {} files for potential refresh.",
-            files_to_refresh.len()
-        ),
-    );
-    let mut refresh_tasks = Vec::new();
+            match client
+                .fetch_bulk_data(
+                    bulk_sem.clone(),
+                    ids_for_lang,
+                    lang,
+                    &format!("Bulk Primary [{}]", lang),
+                )
+                .await
+            {
+                Ok(primary_data) => {
+                    stats.get_mut("Bulk Fetch").unwrap().ok += primary_data.len();
+                    let mut ids_needing_icon_fallback = HashSet::new();
+                    for id in ids_for_lang {
+                        let primary_entry = primary_data.get(id);
+                        let primary_icon = primary_entry
+                            .and_then(|v| v.get("icon_url"))
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty());
+                        if primary_icon.is_none() {
+                            ids_needing_icon_fallback.insert(*id);
+                        }
+                    }
 
-    for (fpath, lang) in files_to_refresh {
-        let c = client.clone();
-        let rs = refresh_sem.clone();
-        let bs = bulk_sem.clone();
-        refresh_tasks.push(tokio::spawn(async move {
-            scan_and_refresh_file(fpath, lang, c, rs, bs).await
-        }));
-    }
+                    let mut fallback_data_map: FallbackBulkDataMap = HashMap::new();
+                    if !ids_needing_icon_fallback.is_empty() {
+                        log(
+                            LogLevel::Info,
+                            &format!(
+                                "Fetching icon fallbacks for {} IDs [{}]...",
+                                ids_needing_icon_fallback.len(),
+                                lang
+                            ),
+                        );
+                        let mut lang_tasks = Vec::new();
+                        let all_langs_for_fallback: Vec<String> =
+                            SUPPORTED_LANGS.iter().cloned().collect();
 
-    let mut files_processed = 0;
-    let refresh_stream = stream::iter(refresh_tasks).buffer_unordered(MAX_BULK_CONCUR * 2);
-    refresh_stream
-        .for_each(|res| {
-            files_processed += 1;
-            match res {
-                Ok(Ok(true)) => {
-                    stats.get_mut("Bulk Refresh").unwrap().files_updated += 1;
-                }
+                        for alt_lang in all_langs_for_fallback.iter() {
+                            if alt_lang == lang {
+                                continue;
+                            }
 
-                Ok(Ok(false)) => {}
+                            let needed = ids_needing_icon_fallback.clone();
+                            let client_clone = client.clone();
+                            let sem_clone = bulk_sem.clone();
+                            let alt_lang_owned = alt_lang.clone();
+                            let ctx_clone = format!("Bulk Icon Alt ({}) for [{}]", alt_lang, lang);
 
-                Ok(Err(e)) => {
-                    log(LogLevel::Error, &format!("Bulk Refresh Task Err: {:?}", e));
-                    stats.get_mut("Bulk Refresh").unwrap().files_failed += 1;
+                            lang_tasks.push(tokio::spawn(async move {
+                                let result = client_clone
+                                    .fetch_bulk_data(
+                                        sem_clone,
+                                        &needed,
+                                        &alt_lang_owned,
+                                        &ctx_clone,
+                                    )
+                                    .await;
+                                (alt_lang_owned, result)
+                            }));
+                        }
+
+                        let results = join_all(lang_tasks).await;
+                        for res in results {
+                            match res {
+                                Ok((l, Ok(bulk_map))) => {
+                                    if !bulk_map.is_empty() {
+                                        stats.get_mut("Bulk Fetch").unwrap().ok += bulk_map.len();
+                                        fallback_data_map.insert(l, bulk_map);
+                                    }
+                                }
+
+                                Ok((l, Err(e))) => {
+                                    log(
+                                        LogLevel::Warning,
+                                        &format!(
+                                            "Bulk Icon Alt ({}) Fetch FAILED for [{}]. Err: {:?}",
+                                            l, lang, e
+                                        ),
+                                    );
+                                    stats.get_mut("Bulk Fetch").unwrap().fail +=
+                                        ids_needing_icon_fallback.len();
+                                }
+
+                                Err(e) => {
+                                    log(
+                                        LogLevel::Error,
+                                        &format!(
+                                            "Bulk Icon Alt Task Panic for [{}]. Err: {:?}",
+                                            lang, e
+                                        ),
+                                    );
+                                    stats.get_mut("Bulk Fetch").unwrap().fail +=
+                                        ids_needing_icon_fallback.len();
+                                }
+                            }
+                        }
+                    }
+
+                    all_bulk_data.insert(lang.clone(), (primary_data, fallback_data_map));
                 }
 
                 Err(e) => {
-                    log(LogLevel::Error, &format!("Bulk Refresh Task Panic! {}", e));
-                    stats.get_mut("Bulk Refresh").unwrap().files_failed += 1;
+                    log(
+                        LogLevel::Error,
+                        &format!("Primary Bulk Fetch FAIL [{}]. Err: {:?}", lang, e),
+                    );
+                    stats.get_mut("Bulk Fetch").unwrap().fail += ids_for_lang.len();
+                }
+            }
+        }
+    }
+
+    log(
+        LogLevel::Info,
+        &format!(
+            "Total unique IDs across all languages: {}",
+            total_ids_to_fetch
+        ),
+    );
+    let bulk_s = stats["Bulk Fetch"].clone();
+    log(
+        if bulk_s.fail == 0 {
+            LogLevel::Success
+        } else {
+            LogLevel::Warning
+        },
+        &format!(
+            "Bulk Fetch phase complete. {} Fetched, {} Failed (approx).",
+            bulk_s.ok, bulk_s.fail
+        ),
+    );
+
+    log(LogLevel::Step, "--- Updating data in memory ---");
+    let mut total_updates = 0;
+
+    for (lang, lists) in data_store.lists.iter_mut() {
+        if let Some((primary_bulk, fallback_bulk)) = all_bulk_data.get(lang) {
+            for list_file in lists.iter_mut() {
+                let list_file_clone = list_file.clone();
+                let menu_id = list_file_clone.menu_id;
+
+                match to_value(list_file_clone) {
+                    Ok(mut list_value) => {
+                        match update_value_with_bulk(
+                            &mut list_value,
+                            primary_bulk,
+                            fallback_bulk,
+                            lang,
+                            0,
+                        ) {
+                            Ok(true) => match serde_json::from_value(list_value) {
+                                Ok(updated_list) => {
+                                    *list_file = updated_list;
+                                    total_updates += 1;
+                                    stats.get_mut("List").unwrap().updated_in_bulk += 1;
+                                }
+
+                                Err(e) => log(
+                                    LogLevel::Error,
+                                    &format!(
+                                        "Failed to deserialize updated List back [{}/{}]: {:?}",
+                                        lang, menu_id, e
+                                    ),
+                                ),
+                            },
+                            Ok(false) => { /* No changes needed */ }
+
+                            Err(e) => log(
+                                LogLevel::Error,
+                                &format!("Error updating List [{}/{}]: {:?}", lang, menu_id, e),
+                            ),
+                        }
+                    }
+
+                    Err(e) => log(
+                        LogLevel::Error,
+                        &format!(
+                            "Failed to serialize List for update [{}/{}]: {:?}",
+                            lang, menu_id, e
+                        ),
+                    ),
+                }
+            }
+        }
+    }
+
+    for (lang, details) in data_store.details.iter_mut() {
+        if let Some((primary_bulk, fallback_bulk)) = all_bulk_data.get(lang) {
+            for detail_page in details.iter_mut() {
+                let detail_page_clone = detail_page.clone();
+                let page_id = detail_page_clone.id;
+
+                match to_value(detail_page_clone) {
+                    Ok(mut detail_value) => {
+                        match update_value_with_bulk(
+                            &mut detail_value,
+                            primary_bulk,
+                            fallback_bulk,
+                            lang,
+                            0,
+                        ) {
+                            Ok(true) => match serde_json::from_value(detail_value) {
+                                Ok(updated_detail) => {
+                                    *detail_page = updated_detail;
+                                    total_updates += 1;
+                                    stats.get_mut("Detail").unwrap().updated_in_bulk += 1;
+                                }
+
+                                Err(e) => log(
+                                    LogLevel::Error,
+                                    &format!(
+                                        "Failed to deserialize updated Detail back [{}/{}]: {:?}",
+                                        lang, page_id, e
+                                    ),
+                                ),
+                            },
+                            Ok(false) => { /* No changes needed */ }
+
+                            Err(e) => log(
+                                LogLevel::Error,
+                                &format!("Error updating Detail [{}/{}]: {:?}", lang, page_id, e),
+                            ),
+                        }
+                    }
+
+                    Err(e) => log(
+                        LogLevel::Error,
+                        &format!(
+                            "Failed to serialize Detail for update [{}/{}]: {:?}",
+                            lang, page_id, e
+                        ),
+                    ),
+                }
+            }
+        }
+    }
+
+    for (lang, calendar_file) in data_store.calendars.iter_mut() {
+        if let Some((primary_bulk, fallback_bulk)) = all_bulk_data.get(lang) {
+            let calendar_file_clone = calendar_file.clone();
+            let lang_clone = lang.clone();
+
+            match to_value(calendar_file_clone) {
+                Ok(mut calendar_value) => {
+                    match update_value_with_bulk(
+                        &mut calendar_value,
+                        primary_bulk,
+                        fallback_bulk,
+                        &lang_clone,
+                        0,
+                    ) {
+                        Ok(true) => match serde_json::from_value(calendar_value) {
+                            Ok(updated_calendar) => {
+                                *calendar_file = updated_calendar;
+                                total_updates += 1;
+                                stats.get_mut("Calendar").unwrap().updated_in_bulk += 1;
+                            }
+
+                            Err(e) => log(
+                                LogLevel::Error,
+                                &format!(
+                                    "Failed to deserialize updated Calendar back [{}]: {:?}",
+                                    lang_clone, e
+                                ),
+                            ),
+                        },
+                        Ok(false) => { /* No changes needed */ }
+
+                        Err(e) => log(
+                            LogLevel::Error,
+                            &format!("Error updating Calendar [{}]: {:?}", lang_clone, e),
+                        ),
+                    }
+                }
+
+                Err(e) => log(
+                    LogLevel::Error,
+                    &format!(
+                        "Failed to serialize Calendar for update [{}]: {:?}",
+                        lang_clone, e
+                    ),
+                ),
+            }
+        }
+    }
+
+    log(
+        LogLevel::Info,
+        &format!("Applied bulk updates to {} data structures.", total_updates),
+    );
+
+    log(LogLevel::Step, "--- Phase 6: Saving updated data ---");
+    let mut save_tasks = Vec::new();
+
+    for (lang, lists) in data_store.lists {
+        for list_file in lists {
+            let l = lang.clone();
+            let file_name = format!(
+                "{}.json",
+                crate::utils::clean_filename(&list_file.menu_id.to_string())
+            );
+            let fpath = dirs["list"].join(&l).join(file_name);
+            let ctx = format!("List Menu:{} [{}]", list_file.menu_id, l);
+            stats.get_mut("Save").unwrap().total += 1;
+            save_tasks.push(tokio::spawn(async move {
+                (ctx, save_json(&fpath, list_file, "").await)
+            }));
+        }
+    }
+
+    for (lang, details) in data_store.details {
+        for detail_page in details {
+            let l = lang.clone();
+            let file_name = format!("{}.json", detail_page.id);
+            let fpath = dirs["detail"].join(&l).join(file_name);
+            let ctx = format!("Detail Entry:{} [{}]", detail_page.id, l);
+            stats.get_mut("Save").unwrap().total += 1;
+            save_tasks.push(tokio::spawn(async move {
+                (ctx, save_json(&fpath, detail_page, "").await)
+            }));
+        }
+    }
+
+    for (lang, calendar_file) in data_store.calendars {
+        let l = lang.clone();
+        let file_name = format!("{}.json", lang);
+        let fpath = dirs["calendar"].join(file_name);
+        let ctx = format!("Calendar [{}]", l);
+        stats.get_mut("Save").unwrap().total += 1;
+        save_tasks.push(tokio::spawn(async move {
+            (ctx, save_json(&fpath, calendar_file, "").await)
+        }));
+    }
+
+    log(
+        LogLevel::Info,
+        &format!("Saving {} files...", save_tasks.len()),
+    );
+    let save_stream = stream::iter(save_tasks).buffer_unordered(MAX_DETAIL_CONCUR * 2);
+    let mut processed_saves = 0;
+    save_stream
+        .for_each(|res| {
+            processed_saves += 1;
+            match res {
+                Ok((_ctx, Ok(true))) => {
+                    stats.get_mut("Save").unwrap().ok += 1;
+                }
+
+                Ok((ctx, Ok(false))) => {
+                    log(LogLevel::Error, &format!("Save FAIL (silent) {}", ctx));
+                    stats.get_mut("Save").unwrap().fail += 1;
+                }
+
+                Ok((ctx, Err(e))) => {
+                    log(
+                        LogLevel::Error,
+                        &format!("Save FAIL (error) {}. Err: {:?}", ctx, e),
+                    );
+                    stats.get_mut("Save").unwrap().fail += 1;
+                }
+
+                Err(e) => {
+                    log(LogLevel::Error, &format!("Save Task Panic! {}", e));
+                    stats.get_mut("Save").unwrap().fail += 1;
                 }
             }
 
-            if files_processed % 500 == 0 || files_processed == stats["Bulk Refresh"].total {
-                let s = stats["Bulk Refresh"].clone();
+            if processed_saves % 500 == 0 || processed_saves == stats["Save"].total {
+                let s = stats["Save"].clone();
                 log(
                     LogLevel::Info,
                     &format!(
-                        "Bulk Refresh progress: {}/{}. ({} Updated, {} Failed)",
-                        files_processed, s.total, s.files_updated, s.files_failed
+                        "Save progress: {}/{}. ({} OK, {} Failed)",
+                        processed_saves, s.total, s.ok, s.fail
                     ),
                 );
             }
@@ -637,101 +1002,105 @@ async fn main_async() -> AppResult<i32> {
         })
         .await;
 
-    let refresh_s = stats["Bulk Refresh"].clone();
+    let save_s = stats["Save"].clone();
     log(
-        if refresh_s.files_failed == 0 {
+        if save_s.fail == 0 {
             LogLevel::Success
         } else {
             LogLevel::Warning
         },
         &format!(
-            "Bulk Refresh phase complete. {} Files Processed, {} Updated, {} Failed.",
-            refresh_s.total, refresh_s.files_updated, refresh_s.files_failed
+            "Save phase complete. {} OK, {} Failed.",
+            save_s.ok, save_s.fail
         ),
     );
 
     let duration = start_time.elapsed();
-    let sep = "=".repeat(53);
-    println!("\n{}\n{:^53}\n{}", sep, "Run Summary", sep);
+    let sep = "=".repeat(60);
+    println!("\n{}\n{:^60}\n{}", sep, "Run Summary", sep);
     println!(
         "Languages Fetched: {} ({})",
         target_langs.len(),
         target_langs.join(", ")
     );
     println!("Total Run Time:    {:.3?}", duration);
-    println!("{}", "-".repeat(53));
+    println!("{}", "-".repeat(60));
     println!(
-        "{:<15} {:<6} {:<9} {:<6} {:<6}",
-        "Category", "OK", "Empty/Skip", "Fail", "Total"
+        "{:<15} {:<6} {:<9} {:<6} {:<8} {:<6}",
+        "Category", "OK", "Empty/Skip", "Fail", "BulkUpd", "Total"
     );
-    println!("{}", "-".repeat(53));
+    println!("{}", "-".repeat(60));
 
     let mut grand_total_tasks = 0;
     let mut grand_total_ok = 0;
     let mut grand_total_empty = 0;
     let mut grand_total_fail = 0;
+    let mut grand_total_updated = 0;
     let mut critical_fail = false;
 
     for cat in ["Navigation", "List", "Detail", "Calendar"] {
         let s = stats.get(cat).cloned().unwrap_or_default();
         println!(
-            "{:<15} {:<6} {:<9} {:<6} {:<6}",
-            cat, s.ok, s.empty, s.fail, s.total
+            "{:<15} {:<6} {:<9} {:<6} {:<8} {:<6}",
+            cat, s.ok, s.empty, s.fail, s.updated_in_bulk, s.total
         );
         grand_total_tasks += s.total;
         grand_total_ok += s.ok;
         grand_total_empty += s.empty;
         grand_total_fail += s.fail;
+        grand_total_updated += s.updated_in_bulk;
 
-        if s.total > 0 && s.ok == 0 && (cat == "Navigation" || cat == "List" || cat == "Detail") {
+        if s.total > 0 && s.ok == 0 {
             critical_fail = true;
         }
     }
 
-    println!("{}", "-".repeat(53));
-    let rf_s = stats["Bulk Refresh"].clone();
+    println!("{}", "-".repeat(60));
+    let bulk_s = stats["Bulk Fetch"].clone();
+    let save_s = stats["Save"].clone();
     println!(
-        "{:<15} {:<6} {:<9} {:<6} {:<6}",
-        "Bulk Refresh",
-        rf_s.files_updated,
-        rf_s.total - rf_s.files_updated - rf_s.files_failed,
-        rf_s.files_failed,
-        rf_s.total
+        "{:<15} {:<6} {:<9} {:<6} {:<8} {:<6}",
+        "Bulk Fetch", bulk_s.ok, bulk_s.empty, bulk_s.fail, bulk_s.updated_in_bulk, bulk_s.total
     );
     println!(
-        "{:<15} {:<6} {:<9} {:<6} {:<6}",
-        "Files Proc.", rf_s.files_processed, "", "", ""
+        "{:<15} {:<6} {:<9} {:<6} {:<8} {:<6}",
+        "Save", save_s.ok, save_s.empty, save_s.fail, save_s.updated_in_bulk, save_s.total
     );
 
-    println!("{}", "-".repeat(53));
+    println!("{}", "-".repeat(60));
     println!(
-        "{:<15} {:<6} {:<9} {:<6} {:<6}",
-        "TOTALS", grand_total_ok, grand_total_empty, grand_total_fail, grand_total_tasks
+        "{:<15} {:<6} {:<9} {:<6} {:<8} {:<6}",
+        "TOTALS (Fetch)",
+        grand_total_ok,
+        grand_total_empty,
+        grand_total_fail,
+        grand_total_updated,
+        grand_total_tasks
     );
     println!("{}", sep);
 
     let exit_code = if critical_fail {
-        log(LogLevel::Error, &format!("Run completed with CRITICAL failures in core phase(s). {} OK, {} Failures, {} Skipped/Empty out of {} total tasks.", grand_total_ok, grand_total_fail, grand_total_empty, grand_total_tasks));
+        log(LogLevel::Error, &format!("Run completed with CRITICAL failures in core fetch phase(s). {} OK, {} Failures, {} Skipped/Empty out of {} total tasks.", grand_total_ok, grand_total_fail, grand_total_empty, grand_total_tasks));
         1
-    } else if grand_total_fail > 0 || rf_s.files_failed > 0 {
+    } else if grand_total_fail > 0 || bulk_s.fail > 0 || save_s.fail > 0 {
         log(
             LogLevel::Warning,
             &format!(
-                "Run completed with {} task failures and {} refresh failures.",
-                grand_total_fail, rf_s.files_failed
+                "Run completed with {} task failures, {} bulk fetch failures, and {} save failures.",
+                grand_total_fail, bulk_s.fail, save_s.fail
             ),
         );
         0
     } else if grand_total_tasks == 0 && !target_langs.is_empty() {
         log(
             LogLevel::Warning,
-            "No tasks were generated or executed for the selected languages.",
+            "No fetch tasks were generated or executed for the selected languages.",
         );
         1
     } else if grand_total_ok == 0 && grand_total_tasks > 0 {
         log(
             LogLevel::Error,
-            "Run completed, but NO tasks succeeded. All tasks either failed or were skipped/empty.",
+            "Run completed, but NO fetch tasks succeeded. All tasks either failed or were skipped/empty.",
         );
         1
     } else {
@@ -745,122 +1114,4 @@ async fn main_async() -> AppResult<i32> {
         &format!("--- Finished at {} ---", end_ts_str),
     );
     Ok(exit_code)
-}
-
-async fn scan_and_refresh_file(
-    fpath: PathBuf,
-    lang: String,
-    client: Arc<ApiClient>,
-    refresh_sem: Arc<Semaphore>,
-    bulk_sem: Arc<Semaphore>,
-) -> AppResult<bool> {
-    let _permit = refresh_sem
-        .acquire()
-        .await
-        .map_err(|e| AppError::Unexpected(format!("Refresh semaphore acquire failed: {}", e)))?;
-    let log_ctx = format!(
-        "Refresh File [{}] {}",
-        lang,
-        fpath.file_name().unwrap_or_default().to_string_lossy()
-    );
-
-    let content = fs::read_to_string(&fpath).await?;
-    let mut value: Value = from_str(&content).map_err(AppError::SerdeJsonSerialize)?;
-
-    let mut ids_to_refresh = HashSet::new();
-    collect_nested_ep_ids(&value, &mut ids_to_refresh, 0)?;
-
-    if ids_to_refresh.is_empty() {
-        return Ok(false);
-    }
-
-    let primary_bulk_data = client
-        .fetch_bulk_data(
-            bulk_sem.clone(),
-            &ids_to_refresh,
-            &lang,
-            &format!("{} Primary", log_ctx),
-        )
-        .await?;
-
-    let mut fallback_bulk_data_map: HashMap<String, HashMap<EntryId, Value>> = HashMap::new();
-    let mut ids_needing_icon_fallback = HashSet::new();
-
-    for id in &ids_to_refresh {
-        let primary_entry = primary_bulk_data.get(id);
-        let primary_icon = primary_entry
-            .and_then(|v| v.get("icon_url"))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
-        if primary_icon.is_none() {
-            ids_needing_icon_fallback.insert(*id);
-        }
-    }
-
-    if !ids_needing_icon_fallback.is_empty() {
-        let all_langs: Vec<String> = SUPPORTED_LANGS.iter().cloned().collect();
-        let mut lang_tasks = Vec::new();
-        for alt_lang in all_langs.iter() {
-            if alt_lang == &lang {
-                continue;
-            }
-
-            let needed = ids_needing_icon_fallback.clone();
-            let client_clone = client.clone();
-            let sem_clone = bulk_sem.clone();
-            let alt_lang_owned = alt_lang.clone();
-            let ctx_clone = format!("{} Icon Alt ({})", log_ctx, alt_lang);
-
-            lang_tasks.push(tokio::spawn(async move {
-                let result = client_clone
-                    .fetch_bulk_data(sem_clone, &needed, &alt_lang_owned, &ctx_clone)
-                    .await;
-                (alt_lang_owned, result)
-            }));
-        }
-
-        let results = futures::future::join_all(lang_tasks).await;
-        for res in results {
-            match res {
-                Ok((l, Ok(bulk_map))) => {
-                    fallback_bulk_data_map.insert(l, bulk_map);
-                }
-
-                Ok((l, Err(e))) => {
-                    log(
-                        LogLevel::Warning,
-                        &format!("{} Icon Alt ({}) Fetch FAILED. Err: {:?}", log_ctx, l, e),
-                    );
-                }
-
-                Err(e) => {
-                    log(
-                        LogLevel::Error,
-                        &format!("{} Icon Alt Task Panic! Err: {:?}", log_ctx, e),
-                    );
-                }
-            }
-        }
-    }
-
-    let modified = update_value_with_bulk(
-        &mut value,
-        &primary_bulk_data,
-        &fallback_bulk_data_map,
-        &lang,
-        0,
-    )?;
-
-    if modified {
-        if save_json(&fpath, value.clone(), &log_ctx).await? {
-            Ok(true)
-        } else {
-            Err(AppError::Processing(format!(
-                "Failed to save updated file: {}",
-                fpath.display()
-            )))
-        }
-    } else {
-        Ok(false)
-    }
 }

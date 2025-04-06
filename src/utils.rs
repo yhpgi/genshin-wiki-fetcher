@@ -245,6 +245,44 @@ pub fn collect_nested_ep_ids(
                 }
             }
 
+            if let Some(Value::String(node_type)) = map.get("type") {
+                match node_type.as_str() {
+                    "custom-entry" => {
+                        if let Some(id_val) = map.get("ep_id") {
+                            if let Some(id) = id_val.as_i64() {
+                                if id > 0 {
+                                    collected_ids.insert(id);
+                                }
+                            } else if let Some(id_str) = id_val.as_str() {
+                                if let Ok(id) = id_str.parse() {
+                                    if id > 0 {
+                                        collected_ids.insert(id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    "custom-post" => {
+                        if let Some(id_val) = map.get("post_id") {
+                            if let Some(id) = id_val.as_i64() {
+                                if id > 0 {
+                                    collected_ids.insert(id);
+                                }
+                            } else if let Some(id_str) = id_val.as_str() {
+                                if let Ok(id) = id_str.parse() {
+                                    if id > 0 {
+                                        collected_ids.insert(id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    _ => {}
+                }
+            }
+
             for v in map.values() {
                 collect_nested_ep_ids(v, collected_ids, depth + 1)?;
             }
@@ -282,39 +320,67 @@ pub fn update_value_with_bulk(
             let current_id: Option<EntryId> = map
                 .get("ep_id")
                 .or_else(|| map.get("entry_page_id"))
+                .or_else(|| map.get("id"))
                 .and_then(|v| {
                     v.as_i64()
                         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
                 });
 
-            if let Some(id) = current_id {
-                if let Some(Value::Object(primary_fetched)) = primary_bulk.get(&id) {
-                    if let Some(bulk_name) = primary_fetched.get("name").cloned() {
+            let custom_entry_id: Option<EntryId> =
+                if map.get("type") == Some(&Value::String("custom-entry".to_string())) {
+                    map.get("ep_id").and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
+                } else {
+                    None
+                };
+
+            let custom_post_id: Option<EntryId> =
+                if map.get("type") == Some(&Value::String("custom-post".to_string())) {
+                    map.get("post_id").and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
+                } else {
+                    None
+                };
+
+            let id_to_use = current_id.or(custom_entry_id).or(custom_post_id);
+
+            if let Some(id) = id_to_use {
+                if id > 0 {
+                    let primary_fetched = primary_bulk.get(&id).and_then(|v| v.as_object());
+                    let mut final_icon_url: Option<Value> = None;
+
+                    if let Some(bulk_name) = primary_fetched.and_then(|pf| pf.get("name")).cloned()
+                    {
                         if map.get("name") != Some(&bulk_name) {
-                            map.insert("name".to_string(), bulk_name);
-                            modified = true;
+                            if map.get("type") != Some(&Value::String("custom-post".to_string()))
+                                || !map.contains_key("name")
+                            {
+                                map.insert("name".to_string(), bulk_name);
+                                modified = true;
+                            }
                         }
                     }
 
-                    if let Some(bulk_desc) = primary_fetched.get("desc").cloned() {
+                    let bulk_desc_opt = primary_fetched.and_then(|pf| pf.get("desc")).cloned();
+                    if let Some(bulk_desc) = bulk_desc_opt {
                         if map.get("desc") != Some(&bulk_desc) {
                             map.insert("desc".to_string(), bulk_desc);
                             modified = true;
                         }
                     } else {
-                        if !map.contains_key("desc")
-                            || map.get("desc").map_or(false, |v| !v.is_null())
-                        {
-                            map.insert("desc".to_string(), Value::Null);
+                        if map.contains_key("desc") {
+                            map.remove("desc");
                             modified = true;
                         }
                     }
 
-                    let mut final_icon_url: Option<Value> = None;
-
-                    if let Some(icon_val) = primary_fetched.get("icon_url") {
+                    if let Some(icon_val) = primary_fetched.and_then(|pf| pf.get("icon_url")) {
                         if let Some(icon_str) = icon_val.as_str() {
-                            if !icon_str.is_empty() {
+                            if !icon_str.is_empty() && !icon_str.contains("invalid-file") {
                                 final_icon_url = Some(icon_val.clone());
                             }
                         }
@@ -322,10 +388,14 @@ pub fn update_value_with_bulk(
 
                     if final_icon_url.is_none() {
                         for (_lang, fallback_map) in fallback_bulk.iter() {
-                            if let Some(Value::Object(fallback_entry)) = fallback_map.get(&id) {
+                            if let Some(fallback_entry) =
+                                fallback_map.get(&id).and_then(|v| v.as_object())
+                            {
                                 if let Some(fallback_icon_val) = fallback_entry.get("icon_url") {
                                     if let Some(fallback_icon_str) = fallback_icon_val.as_str() {
-                                        if !fallback_icon_str.is_empty() {
+                                        if !fallback_icon_str.is_empty()
+                                            && !fallback_icon_str.contains("invalid-file")
+                                        {
                                             final_icon_url = Some(fallback_icon_val.clone());
                                             break;
                                         }
@@ -335,8 +405,8 @@ pub fn update_value_with_bulk(
                         }
                     }
 
+                    let current_icon = map.get("icon_url").or_else(|| map.get("icon"));
                     if let Some(icon_to_use) = final_icon_url {
-                        let current_icon = map.get("icon_url").or_else(|| map.get("icon"));
                         if current_icon != Some(&icon_to_use) {
                             map.insert("icon_url".to_string(), icon_to_use);
                             map.remove("icon");
@@ -344,43 +414,16 @@ pub fn update_value_with_bulk(
                         }
                     } else {
                         let empty_icon = json!("");
-                        if map.get("icon_url") != Some(&empty_icon)
-                            && map.get("icon") != Some(&empty_icon)
-                        {
-                            map.insert("icon_url".to_string(), empty_icon);
+                        if current_icon.is_some() && current_icon != Some(&empty_icon) {
+                            map.insert("icon_url".to_string(), empty_icon.clone());
                             map.remove("icon");
                             modified = true;
-                        }
-                    }
-                } else {
-                    let mut fallback_icon_url: Option<Value> = None;
-                    for (_lang, fallback_map) in fallback_bulk.iter() {
-                        if let Some(Value::Object(fallback_entry)) = fallback_map.get(&id) {
-                            if let Some(fallback_icon_val) = fallback_entry.get("icon_url") {
-                                if let Some(fallback_icon_str) = fallback_icon_val.as_str() {
-                                    if !fallback_icon_str.is_empty() {
-                                        fallback_icon_url = Some(fallback_icon_val.clone());
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(icon_to_use) = fallback_icon_url {
-                        let current_icon = map.get("icon_url").or_else(|| map.get("icon"));
-                        if current_icon != Some(&icon_to_use) {
-                            map.insert("icon_url".to_string(), icon_to_use);
-                            map.remove("icon");
+                        } else if current_icon.is_none() && !map.contains_key("icon_url") {
+                            map.insert("icon_url".to_string(), empty_icon);
                             modified = true;
-                        }
-                    } else {
-                        let empty_icon = json!("");
-                        if map.get("icon_url") != Some(&empty_icon)
-                            && map.get("icon") != Some(&empty_icon)
+                        } else if current_icon.is_none() && map.get("icon_url") != Some(&empty_icon)
                         {
                             map.insert("icon_url".to_string(), empty_icon);
-                            map.remove("icon");
                             modified = true;
                         }
                     }
@@ -389,7 +432,10 @@ pub fn update_value_with_bulk(
 
             let keys: Vec<String> = map.keys().cloned().collect();
             for key in keys {
-                if let Some(value) = map.get_mut(&key) {
+                if id_to_use.is_some()
+                    && (key == "name" || key == "desc" || key == "icon_url" || key == "icon")
+                {
+                } else if let Some(value) = map.get_mut(&key) {
                     if update_value_with_bulk(
                         value,
                         primary_bulk,
@@ -510,6 +556,7 @@ fn filter_component_inplace(comp: &mut Component) -> bool {
         && match &comp.data {
             Value::Null => false,
             Value::Object(map) => !map.is_empty(),
+            Value::Array(arr) => !arr.is_empty(),
             _ => true,
         }
 }
@@ -542,7 +589,15 @@ pub async fn process_and_filter_detail(
     let modules_is_empty = raw_page.modules.is_empty();
     let filters_is_null = filter_values_processed.is_null();
 
-    let has_content = !name_is_empty || !desc_is_none || !modules_is_empty || !filters_is_null;
+    let header_img_is_none = raw_page.header_img_url.is_none();
+    let icon_url_is_none = raw_page.icon_url.is_none();
+
+    let has_content = !name_is_empty
+        || !desc_is_none
+        || !modules_is_empty
+        || !filters_is_null
+        || !header_img_is_none
+        || !icon_url_is_none;
 
     if !has_content {
         log(
@@ -622,6 +677,14 @@ pub fn process_filters_value(raw_filters_val: &Value) -> Value {
 
                         _ => {}
                     }
+                } else if let Value::String(s) = field_data {
+                    if !s.is_empty() {
+                        values.insert(s.clone());
+                    }
+                } else if let Value::Number(n) = field_data {
+                    values.insert(n.to_string());
+                } else if let Value::Bool(b) = field_data {
+                    values.insert(b.to_string());
                 }
 
                 if !values.is_empty() {
@@ -651,43 +714,29 @@ pub fn process_filters_value(raw_filters_val: &Value) -> Value {
 pub fn process_cal_abstracts_bulk(
     abstract_list_val: &Value,
     vision_map: &HashMap<EntryId, String>,
-    bulk_data: &HashMap<EntryId, Value>,
+    _bulk_data: &HashMap<EntryId, Value>,
 ) -> Vec<CalendarAbstract> {
     let mut simplified = Vec::new();
     if let Value::Array(list) = abstract_list_val {
         for val in list {
             if let Value::Object(map) = val {
-                let id_res = map.get("entry_page_id").and_then(|v| {
-                    v.as_i64()
-                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-                });
+                let id_res = map
+                    .get("entry_page_id")
+                    .or_else(|| map.get("id"))
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    });
 
                 if let Some(id) = id_res {
                     if id > 0 {
-                        let bulk_entry = bulk_data.get(&id);
-                        let name = bulk_entry
-                            .and_then(|b| {
-                                b.get("name")
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                            })
-                            .or_else(|| map.get("name").and_then(Value::as_str))
+                        let name = map.get("name").and_then(Value::as_str).unwrap_or("");
+                        let icon = map
+                            .get("icon_url")
+                            .or_else(|| map.get("icon"))
+                            .and_then(Value::as_str)
                             .unwrap_or("");
-                        let icon = bulk_entry
-                            .and_then(|b| {
-                                b.get("icon_url")
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                            })
-                            .or_else(|| map.get("icon_url").and_then(Value::as_str))
-                            .unwrap_or("");
-                        let desc = bulk_entry
-                            .and_then(|b| {
-                                b.get("desc")
-                                    .and_then(Value::as_str)
-                                    .filter(|s| !s.is_empty())
-                            })
-                            .map(String::from);
+                        let desc = map.get("desc").and_then(Value::as_str).map(String::from);
 
                         if !name.is_empty() || !icon.is_empty() {
                             simplified.push(CalendarAbstract {
@@ -742,11 +791,15 @@ fn parse_html_content(html_string: &str) -> AppResult<Vec<HtmlNode>> {
 
     let fragment = Html::parse_fragment(&wrapped);
     let root_element = fragment.root_element();
-    let parsed_nodes = parse_element_content(root_element, 0)?;
+    let parsed_nodes = parse_element_content(root_element, 0, false)?;
     Ok(merge_consecutive_rich_text(parsed_nodes))
 }
 
-fn parse_element_content(element_ref: ElementRef<'_>, depth: u32) -> AppResult<Vec<HtmlNode>> {
+fn parse_element_content(
+    element_ref: ElementRef<'_>,
+    depth: u32,
+    is_ordered_list: bool,
+) -> AppResult<Vec<HtmlNode>> {
     if depth > MAX_RECURSION_DEPTH / 2 {
         return Ok(vec![HtmlNode::RichText {
             text: "[HTML Depth Limit]".into(),
@@ -756,42 +809,27 @@ fn parse_element_content(element_ref: ElementRef<'_>, depth: u32) -> AppResult<V
 
     let mut results = Vec::new();
     let mut current_rich_text = String::new();
-    let mut is_ordered_list = false;
     let mut list_counter = 1;
 
     for child_node in element_ref.children() {
         match child_node.value() {
             Node::Text(text_node) => {
                 let text = clean_consecutive_slashes(text_node.text.as_ref());
-                let trimmed_text = text.trim();
-                if !trimmed_text.is_empty() {
-                    if !current_rich_text.is_empty()
-                        && !current_rich_text.ends_with('\n')
-                        && !current_rich_text.ends_with(char::is_whitespace)
-                    {
-                        current_rich_text.push(' ');
-                    }
 
-                    current_rich_text.push_str(trimmed_text);
-                } else if text.contains('\n')
-                    && !current_rich_text.is_empty()
-                    && !current_rich_text.ends_with('\n')
-                {
-                    current_rich_text.push('\n');
-                }
+                current_rich_text.push_str(&text);
             }
 
             Node::Element(el_data) => {
                 if let Some(child_element_ref) = ElementRef::wrap(child_node) {
                     let tag_name = el_data.name().to_lowercase();
+                    let current_alignment = get_node_alignment(&element_ref);
 
                     if HEADING_TAGS.contains(tag_name.as_str()) {
                         flush_rich_text(
                             &mut current_rich_text,
                             &mut results,
-                            get_node_alignment(&element_ref),
+                            current_alignment.as_deref(),
                         );
-                        list_counter = 1;
                         if let Ok(level) = tag_name[1..].parse::<u8>() {
                             let alignment = get_node_alignment(&child_element_ref);
                             let heading_text = extract_plain_text(child_element_ref, depth + 1)?;
@@ -807,64 +845,127 @@ fn parse_element_content(element_ref: ElementRef<'_>, depth: u32) -> AppResult<V
                         flush_rich_text(
                             &mut current_rich_text,
                             &mut results,
-                            get_node_alignment(&element_ref),
+                            current_alignment.as_deref(),
                         );
-                        list_counter = 1;
                         if let Some(node) = process_custom_element(child_element_ref) {
                             results.push(node);
                         }
                     } else if tag_name == "br" {
-                        if !current_rich_text.is_empty() && !current_rich_text.ends_with('\n') {
+                        if !current_rich_text.ends_with('\n') {
                             current_rich_text.push('\n');
                         }
                     } else if tag_name == "ul" || tag_name == "ol" {
                         flush_rich_text(
                             &mut current_rich_text,
                             &mut results,
-                            get_node_alignment(&element_ref),
+                            current_alignment.as_deref(),
                         );
-                        results.extend(parse_element_content(child_element_ref, depth + 1)?);
-                        list_counter = 1;
-                        is_ordered_list = false;
+
+                        let new_is_ordered = tag_name == "ol";
+                        results.extend(parse_element_content(
+                            child_element_ref,
+                            depth + 1,
+                            new_is_ordered,
+                        )?);
+
                         flush_rich_text(
                             &mut current_rich_text,
                             &mut results,
-                            get_node_alignment(&element_ref),
+                            current_alignment.as_deref(),
                         );
                     } else if tag_name == "li" {
                         flush_rich_text(
                             &mut current_rich_text,
                             &mut results,
-                            get_node_alignment(&element_ref),
+                            current_alignment.as_deref(),
                         );
-                        let li_text = extract_plain_text(child_element_ref, depth + 1)?;
-                        if !li_text.is_empty() {
-                            let prefix = if is_ordered_list {
-                                format!("{}. ", list_counter)
-                            } else {
-                                "* ".to_string()
-                            };
-                            current_rich_text.push_str(&prefix);
-                            current_rich_text.push_str(&li_text);
-                            list_counter += 1;
-                            if !current_rich_text.ends_with('\n') {
-                                current_rich_text.push('\n');
+
+                        let li_content_nodes =
+                            parse_element_content(child_element_ref, depth + 1, is_ordered_list)?;
+                        let prefix = if is_ordered_list {
+                            format!("{}. ", list_counter)
+                        } else {
+                            "* ".to_string()
+                        };
+                        list_counter += 1;
+
+                        if let Some(first_node) = li_content_nodes.first() {
+                            match first_node {
+                                HtmlNode::RichText { text, alignment } => {
+                                    let mut prefixed_nodes = vec![HtmlNode::RichText {
+                                        text: format!("{}{}", prefix, text),
+                                        alignment: alignment.clone(),
+                                    }];
+                                    prefixed_nodes.extend_from_slice(&li_content_nodes[1..]);
+                                    results.extend(prefixed_nodes);
+                                }
+
+                                _ => {
+                                    results.push(HtmlNode::RichText {
+                                        text: prefix,
+                                        alignment: None,
+                                    });
+                                    results.extend(li_content_nodes);
+                                }
+                            }
+                        } else {
+                            results.push(HtmlNode::RichText {
+                                text: prefix,
+                                alignment: None,
+                            });
+                        }
+
+                        if !results.is_empty() {
+                            if let Some(last_node) = results.last_mut() {
+                                match last_node {
+                                    HtmlNode::RichText { text, .. } => {
+                                        if !text.ends_with('\n') {
+                                            text.push('\n');
+                                        }
+                                    }
+
+                                    _ => {}
+                                }
                             }
                         }
                     } else if HTML_STRIP_TAGS.contains(tag_name.as_str()) {
-                        results.extend(parse_element_content(child_element_ref, depth + 1)?);
+                        results.extend(parse_element_content(
+                            child_element_ref,
+                            depth + 1,
+                            is_ordered_list,
+                        )?);
                     } else if HTML_BLOCK_TAGS.contains(tag_name.as_str())
                         || tag_name == "body"
                         || tag_name == "html"
                     {
-                        let alignment = get_node_alignment(&child_element_ref);
-                        flush_rich_text(&mut current_rich_text, &mut results, alignment);
-                        list_counter = 1;
-                        results.extend(parse_element_content(child_element_ref, depth + 1)?);
+                        let block_alignment = get_node_alignment(&child_element_ref);
+                        flush_rich_text(
+                            &mut current_rich_text,
+                            &mut results,
+                            block_alignment.as_deref(),
+                        );
+
+                        results.extend(parse_element_content(
+                            child_element_ref,
+                            depth + 1,
+                            is_ordered_list,
+                        )?);
+                        flush_rich_text(
+                            &mut current_rich_text,
+                            &mut results,
+                            block_alignment.as_deref(),
+                        );
+
                         if !results.is_empty() {
-                            if let Some(HtmlNode::RichText { text, .. }) = results.last_mut() {
-                                if !text.is_empty() && !text.ends_with('\n') {
-                                    text.push('\n');
+                            if let Some(last_node) = results.last_mut() {
+                                match last_node {
+                                    HtmlNode::RichText { text, .. } => {
+                                        if !text.ends_with('\n') {
+                                            text.push('\n');
+                                        }
+                                    }
+
+                                    _ => {}
                                 }
                             }
                         }
@@ -890,7 +991,7 @@ fn parse_element_content(element_ref: ElementRef<'_>, depth: u32) -> AppResult<V
     flush_rich_text(
         &mut current_rich_text,
         &mut results,
-        get_node_alignment(&element_ref),
+        get_node_alignment(&element_ref).as_deref(),
     );
     results.retain(|node| !node.is_empty_text());
     Ok(results)
@@ -901,6 +1002,11 @@ fn merge_consecutive_rich_text(nodes: Vec<HtmlNode>) -> Vec<HtmlNode> {
     for node in nodes {
         match node {
             HtmlNode::RichText { text, alignment } => {
+                let current_text = normalize_whitespace(&text);
+                if current_text.is_empty() {
+                    continue;
+                }
+
                 if let Some(HtmlNode::RichText {
                     text: last_text,
                     alignment: last_alignment,
@@ -911,48 +1017,55 @@ fn merge_consecutive_rich_text(nodes: Vec<HtmlNode>) -> Vec<HtmlNode> {
                             last_text.push('\n');
                         }
 
-                        last_text.push_str(&text);
+                        last_text.push_str(&current_text);
                         continue;
                     }
                 }
 
-                merged.push(HtmlNode::RichText { text, alignment });
+                merged.push(HtmlNode::RichText {
+                    text: current_text,
+                    alignment,
+                });
             }
 
             other => merged.push(other),
         }
     }
 
+    for node in merged.iter_mut() {
+        if let HtmlNode::RichText { text, .. } = node {
+            *text = text.trim().to_string();
+        }
+    }
+
+    merged.retain(|node| match node {
+        HtmlNode::RichText { text, .. } => !text.is_empty(),
+        _ => true,
+    });
+
     merged
 }
 
-fn flush_rich_text(
-    text_buffer: &mut String,
-    results: &mut Vec<HtmlNode>,
-    alignment: Option<String>,
-) {
+fn flush_rich_text(text_buffer: &mut String, results: &mut Vec<HtmlNode>, alignment: Option<&str>) {
     let cleaned_text = clean_consecutive_slashes(text_buffer);
-    let normalized_text = normalize_whitespace(&cleaned_text);
-    if !normalized_text.is_empty() {
-        let final_text = normalized_text.trim_end_matches('\n').to_string();
-        if !final_text.is_empty() {
-            results.push(HtmlNode::RichText {
-                text: final_text,
-                alignment,
-            });
-        }
+
+    if !cleaned_text.trim().is_empty() {
+        results.push(HtmlNode::RichText {
+            text: cleaned_text.clone(),
+            alignment: alignment.map(String::from),
+        });
     }
 
     text_buffer.clear();
 }
 
 fn normalize_whitespace(text: &str) -> String {
-    text.trim()
-        .split('\n')
+    text.split('\n')
         .map(|line| line.split_whitespace().collect::<Vec<&str>>().join(" "))
-        .filter(|line| !line.is_empty())
         .collect::<Vec<String>>()
         .join("\n")
+        .trim()
+        .to_string()
 }
 
 fn extract_plain_text(element_ref: ElementRef<'_>, depth: u32) -> AppResult<String> {
@@ -969,22 +1082,39 @@ fn extract_plain_text(element_ref: ElementRef<'_>, depth: u32) -> AppResult<Stri
 
             Node::Element(el_data) => {
                 let tag_name = el_data.name().to_lowercase();
-                if tag_name == "br" {
-                    if !text_content.ends_with('\n') {
-                        text_content.push('\n');
-                    }
-                } else if let Some(child_el_ref) = ElementRef::wrap(child_node) {
-                    let child_text = extract_plain_text(child_el_ref, depth + 1)?;
-                    if !child_text.is_empty() {
-                        if !text_content.is_empty()
-                            && !text_content.ends_with(char::is_whitespace)
-                            && !child_text.starts_with(char::is_whitespace)
-                        {
-                            text_content.push(' ');
-                        }
 
-                        text_content.push_str(&child_text);
+                let needs_separator = HTML_BLOCK_TAGS.contains(tag_name.as_str())
+                    || tag_name == "br"
+                    || tag_name == "li";
+
+                if needs_separator
+                    && !text_content.is_empty()
+                    && !text_content.ends_with(char::is_whitespace)
+                {
+                    text_content.push(' ');
+                }
+
+                if let Some(child_el_ref) = ElementRef::wrap(child_node) {
+                    if tag_name != "style" && tag_name != "script" {
+                        let child_text = extract_plain_text(child_el_ref, depth + 1)?;
+                        if !child_text.is_empty() {
+                            if !text_content.is_empty()
+                                && !text_content.ends_with(char::is_whitespace)
+                                && !child_text.starts_with(char::is_whitespace)
+                            {
+                                text_content.push(' ');
+                            }
+
+                            text_content.push_str(&child_text);
+                        }
                     }
+                }
+
+                if needs_separator
+                    && !text_content.is_empty()
+                    && !text_content.ends_with(char::is_whitespace)
+                {
+                    text_content.push(' ');
                 }
             }
 
@@ -1004,7 +1134,7 @@ fn process_custom_element(element_ref: ElementRef<'_>) -> Option<HtmlNode> {
     match tag_name.as_str() {
         "custom-entry" => el_val
             .attr("epid")
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.trim().parse().ok())
             .filter(|&id: &EntryId| id > 0)
             .map(|id| HtmlNode::CustomEntry {
                 ep_id: id,
@@ -1012,20 +1142,21 @@ fn process_custom_element(element_ref: ElementRef<'_>) -> Option<HtmlNode> {
                 icon_url: el_val.attr("icon").unwrap_or("").trim().to_string(),
                 amount: el_val
                     .attr("amount")
-                    .and_then(|s| s.parse().ok())
+                    .and_then(|s| s.trim().parse().ok())
                     .unwrap_or(0),
                 display_style: el_val
                     .attr("displaystyle")
                     .unwrap_or("link")
                     .trim()
                     .to_string(),
-                menu_id: el_val.attr("menuid").and_then(|s| s.parse().ok()),
+                menu_id: el_val.attr("menuid").and_then(|s| s.trim().parse().ok()),
             }),
         "custom-image" => el_val
             .attr("url")
-            .filter(|url| !url.trim().is_empty())
+            .map(|s| s.trim())
+            .filter(|url| !url.is_empty())
             .map(|url| HtmlNode::CustomImage {
-                url: url.trim().to_string(),
+                url: url.to_string(),
                 alignment: el_val
                     .attr("align")
                     .map(|s| s.trim().to_lowercase())
@@ -1034,25 +1165,21 @@ fn process_custom_element(element_ref: ElementRef<'_>) -> Option<HtmlNode> {
         "custom-ruby" => {
             let rb_sel = Selector::parse("rb").ok()?;
             let rt_sel = Selector::parse("rt").ok()?;
-            let rb = clean_consecutive_slashes(
-                &element_ref
-                    .select(&rb_sel)
-                    .next()?
-                    .text()
-                    .collect::<String>(),
-            );
-            let rt = clean_consecutive_slashes(
-                &element_ref
-                    .select(&rt_sel)
-                    .next()?
-                    .text()
-                    .collect::<String>(),
-            );
-            if !rb.trim().is_empty() && !rt.trim().is_empty() {
-                Some(HtmlNode::CustomRuby {
-                    rb: rb.trim().to_string(),
-                    rt: rt.trim().to_string(),
-                })
+            let rb_text = element_ref
+                .select(&rb_sel)
+                .next()?
+                .text()
+                .collect::<String>();
+            let rt_text = element_ref
+                .select(&rt_sel)
+                .next()?
+                .text()
+                .collect::<String>();
+            let rb = normalize_whitespace(&clean_consecutive_slashes(&rb_text));
+            let rt = normalize_whitespace(&clean_consecutive_slashes(&rt_text));
+
+            if !rb.is_empty() && !rt.is_empty() {
+                Some(HtmlNode::CustomRuby { rb, rt })
             } else {
                 None
             }
@@ -1060,14 +1187,15 @@ fn process_custom_element(element_ref: ElementRef<'_>) -> Option<HtmlNode> {
 
         "custom-post" => el_val
             .attr("postid")
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.trim().parse().ok())
             .filter(|&id: &EntryId| id > 0)
             .map(|id| HtmlNode::CustomPost { post_id: id }),
         "custom-video" => el_val
             .attr("url")
-            .filter(|url| !url.trim().is_empty())
+            .map(|s| s.trim())
+            .filter(|url| !url.is_empty())
             .map(|url| HtmlNode::CustomVideo {
-                url: url.trim().to_string(),
+                url: url.to_string(),
             }),
         _ => None,
     }
