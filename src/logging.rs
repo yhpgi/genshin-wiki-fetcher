@@ -113,6 +113,7 @@ pub fn log(level: LogLevel, message: &str) {
                 .map_or("UNKNOWN", |(s, _)| s.as_str())
         )
     });
+
     match level {
         LogLevel::Error => eprintln!("{}{}", prefix, message),
         _ => println!("{}{}", prefix, message),

@@ -36,7 +36,7 @@ pub const LIST_FETCH_DELAY: Duration = Duration::from_millis(10);
 pub const HTTP_TIMEOUT_SECONDS: u64 = 30;
 pub const HTTP_CONNECT_TIMEOUT: u64 = 15;
 pub const MAX_RETRIES: u32 = 3;
-pub const BULK_BATCH_SIZE: usize = 5;
+pub const BULK_BATCH_SIZE: usize = 50;
 pub const MAX_RECURSION_DEPTH: u32 = 500;
 
 const ANDROID_VER: &str = "11";
@@ -92,28 +92,41 @@ pub static LIST_FILTER_FIELDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     ])
 });
 
+pub static MULTI_VALUE_FILTER_FIELDS: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| HashSet::from(["card_character_camp", "object_type", "reliquary_effect"]));
+
 pub static INT_KEYS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     HashSet::from([
-        "id",
-        "ep_id",
         "amount",
         "menu_id",
         "version",
         "entry_page_id",
         "menuId",
+        "ep_id",
     ])
 });
 pub static HTML_CONTENT_COMPONENT_IDS: Lazy<HashSet<&'static str>> =
     Lazy::new(|| HashSet::from(["customize"]));
 pub static HEADING_TAGS: Lazy<HashSet<&'static str>> =
     Lazy::new(|| HashSet::from(["h1", "h2", "h3", "h4", "h5", "h6"]));
+pub static TARGET_HTML_CUSTOM_TAGS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    HashSet::from([
+        "custom-entry",
+        "custom-image",
+        "custom-ruby",
+        "custom-post",
+        "custom-video",
+    ])
+});
+pub static HTML_STRIP_TAGS: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| HashSet::from(["table", "tbody", "tr", "td", "th"]));
+pub static HTML_BLOCK_TAGS: Lazy<HashSet<&'static str>> =
+    Lazy::new(|| HashSet::from(["p", "div", "li", "ul", "ol", "blockquote", "figure"]));
 
 pub static FORBIDDEN_CHARS_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"[<>:"/\\|?*\x00-\x1f\x7f^!@#$%^&*()+={}\[\];,.'’]"#).unwrap());
 pub static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\s_]+").unwrap());
 pub static NUM_STR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^-?\d+(\.\d+)?$").unwrap());
-pub static STYLE_COLOR_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"color:\s*(#[0-9a-fA-F]{6}|rgb\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*\))").unwrap()
-});
 pub static JSON_LIKE_STR_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"^\s*([{\["]|\$\[)"#).unwrap());
+pub static CONSECUTIVE_SLASH_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"//+").unwrap());

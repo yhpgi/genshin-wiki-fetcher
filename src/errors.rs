@@ -24,9 +24,6 @@ pub enum AppError {
     #[error("Data processing error: {0}")]
     Processing(String),
 
-    #[error("HTML parsing error: {0}")]
-    HtmlParsing(String),
-
     #[error("Directory operation failed: {0}")]
     FsExtra(#[from] fs_extra::error::Error),
 
@@ -41,6 +38,9 @@ pub enum AppError {
 
     #[error("Recursion depth limit reached during {context}")]
     RecursionLimit { context: String },
+
+    #[error("Hex decoding error: {0}")]
+    HexDecode(#[from] hex::FromHexError),
 
     #[error("Unexpected error: {0}")]
     Unexpected(String),

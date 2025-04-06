@@ -69,10 +69,8 @@ where
     D: Deserializer<'de>,
 {
     struct OptionalFlexibleI64Visitor;
-
     impl<'de> Visitor<'de> for OptionalFlexibleI64Visitor {
         type Value = Option<i64>;
-
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
             formatter
                 .write_str("an integer, null, empty string, or a string representing an integer")
@@ -175,12 +173,6 @@ pub struct RawFilterEntry {
     pub values: Vec<Value>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct FilterValues {
-    #[serde(flatten)]
-    pub filters: HashMap<String, Vec<String>>,
-}
-
 fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -247,7 +239,6 @@ pub struct Component {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Module {
-    pub id: String,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     pub name: Option<String>,
     #[serde(default)]
@@ -256,8 +247,8 @@ pub struct Module {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RawDetailPage {
-    #[serde(deserialize_with = "deserialize_flexible_i64")]
-    pub id: EntryId,
+    #[serde(default, deserialize_with = "deserialize_optional_flexible_i64")]
+    pub id: Option<EntryId>,
     #[serde(default)]
     pub name: String,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
@@ -270,8 +261,6 @@ pub struct RawDetailPage {
     pub modules: Vec<Module>,
     #[serde(default)]
     pub filter_values: Value,
-    #[serde(deserialize_with = "deserialize_flexible_i64")]
-    pub menu_id: MenuId,
     #[serde(default, deserialize_with = "deserialize_optional_string")]
     pub menu_name: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_flexible_i64")]
@@ -280,6 +269,7 @@ pub struct RawDetailPage {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OutputDetailPage {
+    #[serde(rename = "ep_id")]
     pub id: EntryId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -291,8 +281,8 @@ pub struct OutputDetailPage {
     pub header_img_url: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modules: Vec<Module>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub filter_values: HashMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub filter_values: Value,
     pub menu_id: MenuId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub menu_name: Option<String>,
@@ -336,12 +326,14 @@ pub struct NavResponseData {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CalendarAbstract {
-    #[serde(deserialize_with = "deserialize_flexible_i64")]
-    pub entry_page_id: EntryId,
-    #[serde(default)]
+    #[serde(rename = "ep_id")]
+    pub id: EntryId,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub icon_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desc: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub character_vision: Option<String>,
 }
@@ -397,17 +389,18 @@ pub struct ApiResponseWrapper {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProcessedListItem {
-    pub entry_page_id: EntryId,
-    #[serde(default)]
+    #[serde(rename = "ep_id")]
+    pub id: EntryId,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub icon_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desc: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_field: Option<Value>,
-    #[serde(default)]
-    pub filter_values: FilterValues,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub filter_values: Value,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -433,46 +426,35 @@ pub struct OutputCalendarFile {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all = "kebab-case")]
 pub enum HtmlNode {
-    #[serde(rename = "text")]
-    Text {
+    RichText {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         text: String,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        styles: Vec<String>,
-    },
-    #[serde(rename = "paragraph")]
-    Paragraph {
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        content: Vec<HtmlNode>,
         #[serde(skip_serializing_if = "Option::is_none")]
         alignment: Option<String>,
     },
-    #[serde(rename = "heading")]
     Heading {
         level: u8,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        content: Vec<HtmlNode>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         alignment: Option<String>,
     },
-    #[serde(rename = "list")]
-    List {
-        ordered: bool,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        items: Vec<Vec<HtmlNode>>,
-    },
-    #[serde(rename = "custom_entry")]
+    #[serde(rename = "custom-entry")]
     CustomEntry {
         #[serde(deserialize_with = "deserialize_flexible_i64")]
         ep_id: EntryId,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         name: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         icon_url: String,
-        #[serde(default, deserialize_with = "deserialize_flexible_i64")]
+        #[serde(default, skip_serializing_if = "is_zero")]
         amount: i64,
-        #[serde(default = "default_display_style")]
+        #[serde(
+            default = "default_display_style",
+            skip_serializing_if = "is_default_display_style"
+        )]
         display_style: String,
         #[serde(
             default,
@@ -481,11 +463,28 @@ pub enum HtmlNode {
         )]
         menu_id: Option<MenuId>,
     },
-    #[serde(rename = "custom_image")]
+    #[serde(rename = "custom-image")]
     CustomImage {
         url: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         alignment: Option<String>,
+    },
+    #[serde(rename = "custom-ruby")]
+    CustomRuby {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        rb: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        rt: String,
+    },
+    #[serde(rename = "custom-post")]
+    CustomPost {
+        #[serde(deserialize_with = "deserialize_flexible_i64")]
+        post_id: EntryId,
+    },
+    #[serde(rename = "custom-video")]
+    CustomVideo {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        url: String,
     },
 }
 
@@ -493,8 +492,20 @@ fn default_display_style() -> String {
     "link".to_string()
 }
 
+fn is_default_display_style(style: &str) -> bool {
+    style == "link"
+}
+
+fn is_zero(num: &i64) -> bool {
+    *num == 0
+}
+
 impl HtmlNode {
     pub fn is_empty_text(&self) -> bool {
-        matches!(self, HtmlNode::Text { text, .. } if text.trim().is_empty())
+        match self {
+            HtmlNode::RichText { text, .. } => text.trim().is_empty(),
+            HtmlNode::Heading { text, .. } => text.trim().is_empty(),
+            _ => false,
+        }
     }
 }
